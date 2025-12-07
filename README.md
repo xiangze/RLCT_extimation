@@ -8,7 +8,17 @@ from [RLCT repository](https://github.com/suswei/RLCT)
 compare exact RCLT(Learning Coeciffient) of linear NN and nonlinear NN (softmax/Relu)
 
 - llt_rlct_estimator_for_softmax_DNN.py
-- llc_
+
+    RLCT of small nonlinear coefficient to compare linear matrix decomposition network(exact solutoin).
+
+- llc_rlct_estimator_for_softmax_networks_via_power_posteriors_sgld.py
+
+    outor interpolation of SGLD LLC extimation with NUTS/HMC SGLD extimaiton with pyto.
+
+- llc_training_experiment.py
+
+    LLT selection obserbation during SGD update, small LLC saddlepoint is selected or not.
+
 ## how to  run
 ```
 python estimate_softmaxDNN.py
@@ -24,4 +34,5 @@ python estimate_softmaxDNN.py
 - https://arxiv.org/abs/1806.09597
 - https://arxiv.org/abs/1704.04289
 - https://github.com/suswei/RLCT
-- https://github.com/edmundlth/scalable_learning_coefficient_with_sgld/tree/v1.0
+- https://github.com/edmundlth/scalable_learning_coefficient_with_sgld/tree/v1.0MultiparamShapes.py
+
