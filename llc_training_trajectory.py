@@ -39,8 +39,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 import matplotlib.pyplot as plt
-
-
+import estimate_softmaxDNN 
+import llc_rlct_estimator_for_softmax_networks_via_power_posteriors_sgld as power
 # =========================================================
 # 1. Utility: seeding, device
 # =========================================================
@@ -236,6 +236,7 @@ class LLCConfig:
     epsilons: Tuple[float, ...] = (1e-5, 5e-5, 1e-4, 5e-4, 1e-3)
     max_samples: int = 2000  # cap on number of samples used
     verbose: bool = False
+    method:str= "default"
 
 
 def flatten_params(model: nn.Module) -> torch.Tensor:
@@ -260,7 +261,7 @@ def estimate_llc_sgld(model: nn.Module,
                       task_type: str,
                       llc_cfg: LLCConfig) -> float:
     """
-    Very rough LLC estimator:
+    Very rough LLC estimator(Volume method 体積法):
       1. Treat current model parameters as θ*.
       2. Run SGLD around θ* to sample θ_i.
       3. Compute ΔL_i = L(θ_i) - L(θ*).
@@ -271,7 +272,6 @@ def estimate_llc_sgld(model: nn.Module,
     method in local_coeff_computation.py.
     """
     model.eval()
-    device = device
 
     # Step 0: snapshot θ* and its loss
     theta_star = flatten_params(model).clone().to(device)
@@ -396,7 +396,7 @@ def detect_plateau(history: List[float],
                    tol: float) -> bool:
     """
     Simple plateau detector based on moving average of training loss.
-    If over the last `window` epochs, the relative change is < tol, we say plateau.
+    If ov er the last `window` epochs, the relative change is < tol, we say plateau.
     """
     if len(history) < window + 1:
         return False
@@ -408,24 +408,21 @@ def detect_plateau(history: List[float],
     rel_change = abs(last - first) / first
     return rel_change < tol
 
-
+### main logic
 def train_and_track_llc(cfg: TrainConfig, llc_cfg: LLCConfig):
     os.makedirs(cfg.output_dir, exist_ok=True)
-
     set_seed(cfg.seed)
     device = get_device()
 
     # Load dataset
     train_ds, test_ds, task_type = get_dataset(cfg.dataset, data_root=cfg.data_root)
-
+    
     input_dim = train_ds[0][0].numel()
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
 
     # Build model
     model = get_model(cfg.model, input_dim=input_dim, task_type=task_type).to(device)
-
-    # Loss & optimizer
     loss_fn = get_loss_fn(task_type)
 
     if cfg.optimizer == "sgd":
@@ -493,14 +490,25 @@ def train_and_track_llc(cfg: TrainConfig, llc_cfg: LLCConfig):
             if (epoch % cfg.llc_check_interval == 0 and
                     detect_plateau(train_losses, cfg.plateau_window, cfg.plateau_tol)):
                 print(f"[Epoch {epoch:03d}] Plateau detected, estimating LLC via SGLD...")
-                llc_val = estimate_llc_sgld(
-                    model=model,
-                    train_loader=train_loader,
-                    loss_fn=loss_fn,
-                    device=device,
-                    task_type=task_type,
-                    llc_cfg=llc_cfg,
-                )
+                if(llc_cfg.method=="volume"): #not stable
+                    llc_val = estimate_llc_sgld(
+                        model=model,
+                        train_loader=train_loader,
+                        loss_fn=loss_fn,
+                        device=device,
+                        task_type=task_type,
+                        llc_cfg=llc_cfg,
+                    )
+                elif(llc_cfg.method=="power"):#only for fixed simple model
+                    config=power.LLCConfigs()
+                    parser = argparse.ArgumentParser(config)
+                    args = parser.parse_args()
+                    llc_val = power.calc_lambda(args)
+                else: #default
+                    alpha_list,lambda_list = estimate_softmaxDNN.estimate_lambda(
+                        model=model,
+                    )
+                    llc_val=[alpha_list,lambda_list]
                 print(f"[Epoch {epoch:03d}] Estimated LLC (slope) = {llc_val:.4f}")
 
         llc_values.append(llc_val)
@@ -543,39 +551,20 @@ def train_and_track_llc(cfg: TrainConfig, llc_cfg: LLCConfig):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Track LLC along training trajectory")
-
-    parser.add_argument("--dataset", type=str, default="toy1d",
-                        choices=["toy1d", "mnist"],
-                        help="Dataset name")
-    parser.add_argument("--model", type=str, default="mlp_relu",
-                        choices=["linear", "mlp_relu"],
-                        help="Model architecture")
-    parser.add_argument("--optimizer", type=str, default="sgd",
-                        choices=["sgd", "adam"],
-                        help="Optimizer")
+    parser.add_argument("--dataset", type=str, default="toy1d", choices=["toy1d", "mnist"], help="Dataset name")
+    parser.add_argument("--model", type=str, default="mlp_relu", choices=["linear", "mlp_relu"], help="Model architecture")
+    parser.add_argument("--optimizer", type=str, default="sgd",choices=["sgd", "adam"],help="Optimizer")
 
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--max_epochs", type=int, default=50)
-
-    parser.add_argument("--plateau_window", type=int, default=5,
-                        help="Epoch window for plateau detection")
-    parser.add_argument("--plateau_tol", type=float, default=1e-4,
-                        help="Relative change threshold for plateau detection")
-
-    parser.add_argument("--llc_mode", type=str, default="none",
-                        choices=["none", "precomputed", "online"],
-                        help="How to obtain LLC values")
-    parser.add_argument("--llc_check_interval", type=int, default=5,
-                        help="Epoch interval to check plateau & compute LLC (online mode)")
-
-    parser.add_argument("--precomputed_llc_json", type=str, default=None,
-                        help="Path to JSON file mapping epoch -> LLC (for llc_mode=precomputed)")
-
-    parser.add_argument("--output_dir", type=str, default="./results",
-                        help="Directory to save logs & plots")
-
+    parser.add_argument("--plateau_window", type=int, default=5,  help="Epoch window for plateau detection")
+    parser.add_argument("--plateau_tol", type=float, default=1e-4, help="Relative change threshold for plateau detection")
+    parser.add_argument("--llc_mode", type=str, default="none", choices=["none", "precomputed", "online"],  help="How to obtain LLC values")
+    parser.add_argument("--llc_check_interval", type=int, default=5, help="Epoch interval to check plateau & compute LLC (online mode)")
+    parser.add_argument("--precomputed_llc_json", type=str, default=None, help="Path to JSON file mapping epoch -> LLC (for llc_mode=precomputed)")
+    parser.add_argument("--output_dir", type=str, default="./results", help="Directory to save logs & plots")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_root", type=str, default="./data")
 
@@ -589,7 +578,7 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated epsilons for volume scaling")
     parser.add_argument("--llc_max_samples", type=int, default=2000)
     parser.add_argument("--llc_verbose", action="store_true")
-
+    parser.add_argument("--llc_method", type=str, default="default"),
     return parser.parse_args()
 
 
@@ -624,6 +613,7 @@ def main():
         epsilons=epsilons,
         max_samples=args.llc_max_samples,
         verbose=args.llc_verbose,
+        method=args.llc_method
     )
 
     print("TrainConfig:", asdict(cfg))

@@ -42,14 +42,17 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 from typing import Dict, List, Tuple
-
+from pathlib import Path
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from argparse_dataclass import ArgumentParser
+import models
 
 # --------------------- Dataset ---------------------
 
@@ -69,24 +72,6 @@ def make_gaussian_blobs(n_per_class: int = 120, centers=None, std=0.55, k=3, see
     y = np.concatenate(y).astype(np.int64)
     perm = rng.permutation(len(X))
     return torch.from_numpy(X[perm]), torch.from_numpy(y[perm])
-
-# --------------------- Model ----------------------
-
-class SmallMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, out_dim: int):
-        super().__init__()
-        self.lin1 = nn.Linear(in_dim, hidden)
-        self.lin2 = nn.Linear(hidden, out_dim)
-        # He init
-        nn.init.kaiming_normal_(self.lin1.weight)
-        nn.init.zeros_(self.lin1.bias)
-        nn.init.kaiming_normal_(self.lin2.weight)
-        nn.init.zeros_(self.lin2.bias)
-
-    def forward(self, x: torch.Tensor, alpha: float = 1.0):
-        h = F.relu(self.lin1(x))
-        logits = self.lin2(h)
-        return alpha * logits  # softmax coefficient α multiplies logits
 
 # ------------------- Objectives -------------------
 
@@ -127,7 +112,7 @@ class SGLDConfig:
 
 def sgld_sample(model: nn.Module, X: torch.Tensor, y: torch.Tensor, cfg: SGLDConfig) -> Dict[str, float]:
     # copy so we don't mutate caller's model
-    mdl = SmallMLP(X.shape[1], model.lin1.out_features, model.lin2.out_features)
+    mdl = models.SmallMLP(X.shape[1], model.lin1.out_features, model.lin2.out_features)
     mdl.load_state_dict(model.state_dict())
     mdl.train()
 
@@ -193,40 +178,12 @@ def plot_lambda_vs_alpha(alphas: List[float], lambdas: List[float], out_png: str
     plt.tight_layout()
     plt.savefig(out_png); plt.close()
 
-# --------------------- Main -----------------------
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--n-per-class', type=int, default=120)
-    parser.add_argument('--std', type=float, default=0.55)
-    parser.add_argument('--hidden', type=int, default=16)
-    parser.add_argument('--alphas', type=float, nargs='+', default=[0.5, 1.0, 2.0])
-    parser.add_argument('--betas', type=float, nargs='+', default=[0.1, 0.25, 0.5])
-    parser.add_argument('--sigma-prior', type=float, default=5.0)
-    parser.add_argument('--map-steps', type=int, default=400)
-    parser.add_argument('--sgld-steps', type=int, default=900)
-    parser.add_argument('--burnin-frac', type=float, default=0.6)
-    parser.add_argument('--sample-every', type=int, default=5)
-    parser.add_argument('--step-size', type=float, default=5e-5)
-    parser.add_argument('--step-decay', type=float, default=0.9997)
-    parser.add_argument('--outdir', type=str, default='out_llc_softmax')
-    args = parser.parse_args()
-
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
-
-    os.makedirs(args.outdir, exist_ok=True)
-
-    # data
-    X, y = make_gaussian_blobs(n_per_class=args.n_per_class, std=args.std, k=3, seed=42)
-    in_dim = X.shape[1]; out_dim = int(y.max().item() + 1)
-
-    # storage
+def get_lambda_from_alphabeta(model,args,in_dim,out_dim):
+    alpha_list, lambda_list=[],[]
     summary = {}
-    alpha_list, lambda_list = [] , []
-
     for alpha in args.alphas:
-        base = SmallMLP(in_dim, args.hidden, out_dim)
+        #base = SmallMLP(in_dim, args.hidden, out_dim)
+        base=model(in_dim, args.hidden, out_dim)
         fit_map(base, X, y, alpha=alpha, sigma_prior=args.sigma_prior, steps=args.map_steps)
 
         curve = {}
@@ -262,6 +219,49 @@ def main():
         }
         alpha_list.append(alpha); lambda_list.append(lam)
         print(f"alpha={alpha:>4}: lambda_hat ≈ {lam:.3f} | fit y≈{a_hat:.2f} + ({b_hat:.2f})*(1/β)")
+    return alpha_list,lambda_list,summary
+
+@dataclass
+class LLCConfigs():
+    seed:int=0
+    n_per_class:int=120
+    std:float=0.55
+    hidden:int=16
+    alphas: list[float]=field(default_factory=lambda: [0.5, 1.0, 2.0])
+    betas:list[float]=field(default_factory=lambda: [0.1, 0.25, 0.5])
+    sigma_prior:float=5.0
+    map_steps:int=400
+    sgld_steps:int=900
+    burnin_frac:float=0.6
+    sample_every:int=5
+    step_size:float=5e-5
+    step_decay:float=0.9997
+    outdir:Path=Path('out_llc_softmax')
+
+# --------------------- Main -----------------------
+def main():
+    parser = ArgumentParser(LLCConfigs)
+    args = parser.parse_args()
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # data
+    X, y = make_gaussian_blobs(n_per_class=args.n_per_class, std=args.std, k=3, seed=42)
+    in_dim = X.shape[1]; out_dim = int(y.max().item() + 1)
+    model=models.FlexibleCNN(
+                            in_channels = 1,
+                            num_classes = k,
+                            base_channels = 32,
+                            num_layers = 4,
+                            use_resnet = False,
+                            dropout_rate = 0.1,
+                            use_unet = False,
+                            use_layernorm = False,
+                            task= "classification", )
+
+    # storage
+    alpha_list, lambda_list,summary = get_lambda_from_alphabeta(model,args,in_dim,out_dim)
 
     # λ vs α plot
     png_lambda = os.path.join(args.outdir, 'lambda_vs_alpha.png')
@@ -279,5 +279,4 @@ def main():
 
 if __name__ == '__main__':
     # Make X, y visible to functions that capture it (for l2 prior helper)
-    X, y = make_gaussian_blobs()
     main()

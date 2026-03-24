@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Estimate the Local Learning Coefficient (LLC, aka learning coefficient / RLCT)
 for a small softmax neural network while varying the "softmax coefficient" α
@@ -49,9 +48,9 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 from typing import Dict, List, Tuple, Optional
-
+from argparse_dataclass import ArgumentParser
 import numpy as np
 import torch
 import torch.nn as nn
@@ -438,191 +437,273 @@ def plot_lambda_vs_alpha(alphas: List[float], lambdas: List[float], out_png: str
     plt.tight_layout()
     plt.savefig(out_png); plt.close()
 
-# --------------------- Main -----------------------
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--n-per-class', type=int, default=120)
-    parser.add_argument('--std', type=float, default=0.55)
-    parser.add_argument('--hidden', type=int, default=16)
-    parser.add_argument('--activation', type=str, default='relu', choices=['relu','identity'])
-    parser.add_argument('--alphas', type=float, nargs='+', default=[0.5, 1.0, 2.0])
-    parser.add_argument('--betas', type=float, nargs='+', default=[0.1, 0.25, 0.5])
-    parser.add_argument('--sigma-prior', type=float, default=5.0)
-    parser.add_argument('--outdir', type=str, default='out_llc_softmax')
-
-    # Sampler selection
-    parser.add_argument('--sampler', type=str, default='sgld', choices=['sgld','nuts','compare'])
-
-    # SGLD params
-    parser.add_argument('--map-steps', type=int, default=400)
-    parser.add_argument('--sgld-steps', type=int, default=900)
-    parser.add_argument('--burnin-frac', type=float, default=0.6)
-    parser.add_argument('--sample-every', type=int, default=5)
-    parser.add_argument('--step-decay', type=float, default=0.9997)
-    parser.add_argument('--sgld-stepsize-grid', type=float, nargs='+', default=[5e-5, 2.5e-5])
-    parser.add_argument('--sgld-replicates', type=int, default=3)
-    parser.add_argument('--sgld-estimator', type=str, default='richardson', choices=['smallest','richardson','linfit'])
-    parser.add_argument('--validate-betas', type=float, nargs='*', default=None, help='only with sgld: run nuts at these β to spot-check')
-
-    # NUTS params
-    parser.add_argument('--nuts-warmup', type=int, default=600)
-    parser.add_argument('--nuts-samples', type=int, default=600)
-    parser.add_argument('--chains', type=int, default=1)
-    parser.add_argument('--max-tree-depth', type=int, default=8)
-
-    args = parser.parse_args()
-
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
-    os.makedirs(args.outdir, exist_ok=True)
-
-    # data
-    X, y = make_gaussian_blobs(n_per_class=args.n_per_class, std=args.std, k=3, seed=42)
-    in_dim = X.shape[1]; out_dim = int(y.max().item() + 1)
-    shapes = ParamShapes(in_dim=in_dim, hidden=args.hidden, out_dim=out_dim)
-
+def run_sgld(args, X, y, shapes, in_dim, out_dim):
+    """
+    args.sampler == 'sgld' のブロックを独立関数化。
+    Returns: (summary, alpha_list, lambda_list)
+    """
     summary = {}
-    alpha_list, lambda_list = [] , []
-
-    def nuts_curve(alpha: float):
-        if not _HAVE_PYRO:
-            raise SystemExit("Pyro is not available. Install with `pip install pyro-ppl`.")
-        curve = {}
-        for beta in args.betas:
-            stat = nuts_mean_nll(
-                X=X, y=y, shapes=shapes, alpha=alpha, beta=beta,
-                sigma_prior=args.sigma_prior, activation=args.activation,
-                cfg=NUTSConfig(warmup=args.nuts_warmup, samples=args.nuts_samples, chains=args.chains,
-                               max_tree_depth=args.max_tree_depth, seed=args.seed))
-            curve[float(beta)] = stat
-        return curve
+    alpha_list, lambda_list = [], []
 
     def sgld_curve(alpha: float):
         base = SmallMLP(in_dim, args.hidden, out_dim, activation=args.activation)
         fit_map(base, X, y, alpha=alpha, sigma_prior=args.sigma_prior, steps=args.map_steps)
-        grid = sgld_grid_estimates(base_model=base, X=X, y=y, alpha=alpha, betas=args.betas,
-                                   step_sizes=args.sgld_stepsize_grid, replicates=args.sgld_replicates,
-                                   steps=args.sgld_steps, burnin_frac=args.burnin_frac, sample_every=args.sample_every,
-                                   sigma_prior=args.sigma_prior, step_decay=args.step_decay, seed0=args.seed,
-                                   estimator=args.sgld_estimator)
-        # Build an aggregate curve from grid results
+        grid = sgld_grid_estimates(
+            base_model=base, X=X, y=y, alpha=alpha, betas=args.betas,
+            step_sizes=args.sgld_stepsize_grid, replicates=args.sgld_replicates,
+            steps=args.sgld_steps, burnin_frac=args.burnin_frac, sample_every=args.sample_every,
+            sigma_prior=args.sigma_prior, step_decay=args.step_decay, seed0=args.seed,
+            estimator=args.sgld_estimator
+        )
         curve = {}
         for beta in args.betas:
             g = grid[float(beta)]
             curve[float(beta)] = {
                 "beta": float(beta),
                 "mean_nll": g["aggregate_mean"],
-                # Use variance of mean if available; otherwise None
                 "var_of_mean": g["aggregate_var"],
                 "per_eta": g["per_eta"],
                 "aggregate_info": g["aggregate_info"],
             }
         return curve
 
-    if args.sampler == 'sgld':
-        for alpha in args.alphas:
-            curve = sgld_curve(alpha)
-            betas_sorted = sorted(curve.keys())
-            means = [curve[b]['mean_nll'] for b in betas_sorted]
-            variances = [curve[b].get('var_of_mean', None) for b in betas_sorted]
-            fit = wls_lambda(betas_sorted, means, variances)
+    for alpha in args.alphas:
+        curve = sgld_curve(alpha)
+        betas_sorted = sorted(curve.keys())
+        means = [curve[b]['mean_nll'] for b in betas_sorted]
+        variances = [curve[b].get('var_of_mean', None) for b in betas_sorted]
+        fit = wls_lambda(betas_sorted, means, variances)
 
-            png_curve = os.path.join(args.outdir, f'curve_alpha_{str(alpha).replace(".","p")}.png')
-            a_hat, b_hat = fit['intercept'], -fit['lambda_hat']
-            plot_curve(alpha, betas_sorted, means, variances, a_hat, b_hat, png_curve)
+        png_curve = os.path.join(args.outdir, f'curve_alpha_{str(alpha).replace(".","p")}.png')
+        a_hat, b_hat = fit['intercept'], -fit['lambda_hat']
+        plot_curve(alpha, betas_sorted, means, variances, a_hat, b_hat, png_curve)
 
-            summary[str(alpha)] = {
-                'alpha': alpha,
-                'mode': 'sgld',
-                'betas': betas_sorted,
-                'curve_mean_nll': means,
-                'variances': variances,
-                'wls': fit,
-                'curve_png': os.path.basename(png_curve),
+        summary[str(alpha)] = {
+            'alpha': alpha,
+            'mode': 'sgld',
+            'betas': betas_sorted,
+            'curve_mean_nll': means,
+            'variances': variances,
+            'wls': fit,
+            'curve_png': os.path.basename(png_curve),
+        }
+        alpha_list.append(alpha)
+        lambda_list.append(fit['lambda_hat'])
+        print(f"[SGLD] alpha={alpha:>4}: λ ≈ {fit['lambda_hat']:.3f} (± {fit['se_lambda']:.3f})")
+
+        # spot validation via NUTS for specified betas
+        if args.validate_betas and _HAVE_PYRO:
+            val = {}
+            for b in args.validate_betas:
+                stat = nuts_mean_nll(
+                    X, y, shapes, alpha, b, args.sigma_prior, args.activation,
+                    NUTSConfig(
+                        warmup=args.nuts_warmup, samples=args.nuts_samples, chains=args.chains,
+                        max_tree_depth=args.max_tree_depth, seed=args.seed
+                    )
+                )
+                val[float(b)] = stat
+            summary[str(alpha)]['spot_validation'] = val
+
+    return summary, alpha_list, lambda_list
+
+
+def run_nuts(args, X, y, shapes):
+    """
+    args.sampler == 'nuts' のブロックを独立関数化。
+    Returns: (summary, alpha_list, lambda_list)
+    """
+    if not _HAVE_PYRO:
+        raise SystemExit("Pyro is not available. Install with `pip install pyro-ppl`.")
+
+    summary = {}
+    alpha_list, lambda_list = [], []
+
+    def nuts_curve(alpha: float):
+        curve = {}
+        for beta in args.betas:
+            stat = nuts_mean_nll(
+                X=X, y=y, shapes=shapes, alpha=alpha, beta=beta,
+                sigma_prior=args.sigma_prior, activation=args.activation,
+                cfg=NUTSConfig(
+                    warmup=args.nuts_warmup, samples=args.nuts_samples, chains=args.chains,
+                    max_tree_depth=args.max_tree_depth, seed=args.seed
+                )
+            )
+            curve[float(beta)] = stat
+        return curve
+
+    for alpha in args.alphas:
+        curve = nuts_curve(alpha)
+        betas_sorted = sorted(curve.keys())
+        means = [curve[b]['mean_nll'] for b in betas_sorted]
+        variances = [curve[b]['var_of_mean'] for b in betas_sorted]
+        fit = wls_lambda(betas_sorted, means, variances)
+
+        png_curve = os.path.join(args.outdir, f'curve_alpha_{str(alpha).replace(".","p")}.png')
+        a_hat, b_hat = fit['intercept'], -fit['lambda_hat']
+        plot_curve(alpha, betas_sorted, means, variances, a_hat, b_hat, png_curve)
+
+        summary[str(alpha)] = {
+            'alpha': alpha,
+            'mode': 'nuts',
+            'betas': betas_sorted,
+            'curve_mean_nll': means,
+            'variances': variances,
+            'wls': fit,
+            'curve_png': os.path.basename(png_curve),
+        }
+        alpha_list.append(alpha)
+        lambda_list.append(fit['lambda_hat'])
+        print(f"[NUTS] alpha={alpha:>4}: λ ≈ {fit['lambda_hat']:.3f} (± {fit['se_lambda']:.3f})")
+
+    return summary, alpha_list, lambda_list
+
+
+def run_compare(args, X, y, shapes, in_dim, out_dim):
+    """
+    args.sampler == 'compare' のブロックを独立関数化。
+    Returns: (summary, alpha_list, lambda_list)
+    """
+    if not _HAVE_PYRO:
+        raise SystemExit("Pyro is not available. Install with `pip install pyro-ppl`.")
+
+    summary = {}
+    alpha_list, lambda_list = [], []
+
+    def nuts_curve(alpha: float):
+        curve = {}
+        for beta in args.betas:
+            stat = nuts_mean_nll(
+                X=X, y=y, shapes=shapes, alpha=alpha, beta=beta,
+                sigma_prior=args.sigma_prior, activation=args.activation,
+                cfg=NUTSConfig(
+                    warmup=args.nuts_warmup, samples=args.nuts_samples, chains=args.chains,
+                    max_tree_depth=args.max_tree_depth, seed=args.seed
+                )
+            )
+            curve[float(beta)] = stat
+        return curve
+
+    def sgld_curve(alpha: float):
+        base = SmallMLP(in_dim, args.hidden, out_dim, activation=args.activation)
+        fit_map(base, X, y, alpha=alpha, sigma_prior=args.sigma_prior, steps=args.map_steps)
+        grid = sgld_grid_estimates(
+            base_model=base, X=X, y=y, alpha=alpha, betas=args.betas,
+            step_sizes=args.sgld_stepsize_grid, replicates=args.sgld_replicates,
+            steps=args.sgld_steps, burnin_frac=args.burnin_frac, sample_every=args.sample_every,
+            sigma_prior=args.sigma_prior, step_decay=args.step_decay, seed0=args.seed,
+            estimator=args.sgld_estimator
+        )
+        curve = {}
+        for beta in args.betas:
+            g = grid[float(beta)]
+            curve[float(beta)] = {
+                "beta": float(beta),
+                "mean_nll": g["aggregate_mean"],
+                "var_of_mean": g["aggregate_var"],
+                "per_eta": g["per_eta"],
+                "aggregate_info": g["aggregate_info"],
             }
-            alpha_list.append(alpha); lambda_list.append(fit['lambda_hat'])
-            print(f"[SGLD] alpha={alpha:>4}: λ ≈ {fit['lambda_hat']:.3f} (± {fit['se_lambda']:.3f})")
+        return curve
 
-            # spot validation via NUTS for specified betas
-            if args.validate_betas and _HAVE_PYRO:
-                val = {}
-                for b in args.validate_betas:
-                    stat = nuts_mean_nll(X, y, shapes, alpha, b, args.sigma_prior, args.activation,
-                                         NUTSConfig(warmup=args.nuts_warmup, samples=args.nuts_samples, chains=args.chains,
-                                                    max_tree_depth=args.max_tree_depth, seed=args.seed))
-                    val[float(b)] = stat
-                summary[str(alpha)]['spot_validation'] = val
+    for alpha in args.alphas:
+        curve_nuts = nuts_curve(alpha)
+        curve_sgld = sgld_curve(alpha)
+        betas_sorted = sorted(set(curve_nuts.keys()) & set(curve_sgld.keys()))
 
-    elif args.sampler == 'nuts':
-        if not _HAVE_PYRO:
-            raise SystemExit("Pyro is not available. Install with `pip install pyro-ppl`." )
-        for alpha in args.alphas:
-            curve = nuts_curve(alpha)
-            betas_sorted = sorted(curve.keys())
-            means = [curve[b]['mean_nll'] for b in betas_sorted]
-            variances = [curve[b]['var_of_mean'] for b in betas_sorted]
-            fit = wls_lambda(betas_sorted, means, variances)
+        means_n = [curve_nuts[b]['mean_nll'] for b in betas_sorted]
+        vars_n  = [curve_nuts[b]['var_of_mean'] for b in betas_sorted]
+        means_s = [curve_sgld[b]['mean_nll'] for b in betas_sorted]
+        vars_s  = [curve_sgld[b].get('var_of_mean', None) for b in betas_sorted]
 
-            png_curve = os.path.join(args.outdir, f'curve_alpha_{str(alpha).replace(".","p")}.png')
-            a_hat, b_hat = fit['intercept'], -fit['lambda_hat']
-            plot_curve(alpha, betas_sorted, means, variances, a_hat, b_hat, png_curve)
+        fit_n = wls_lambda(betas_sorted, means_n, vars_n)
+        fit_s = wls_lambda(betas_sorted, means_s, vars_s if all(v is not None for v in vars_s) else None)
 
-            summary[str(alpha)] = {
-                'alpha': alpha,
-                'mode': 'nuts',
-                'betas': betas_sorted,
-                'curve_mean_nll': means,
-                'variances': variances,
-                'wls': fit,
-                'curve_png': os.path.basename(png_curve),
-            }
-            alpha_list.append(alpha); lambda_list.append(fit['lambda_hat'])
-            print(f"[NUTS] alpha={alpha:>4}: λ ≈ {fit['lambda_hat']:.3f} (± {fit['se_lambda']:.3f})")
+        dels, del_vars = [], []
+        for i, b in enumerate(betas_sorted):
+            d = means_s[i] - means_n[i]
+            v = (vars_s[i] if vars_s[i] is not None else 0.0) + (vars_n[i] if vars_n[i] is not None else 0.0)
+            dels.append(d)
+            del_vars.append(v if v > 0 else None)
 
-    else:  # compare
-        if not _HAVE_PYRO:
-            raise SystemExit("Pyro is not available. Install with `pip install pyro-ppl`." )
-        for alpha in args.alphas:
-            curve_nuts = nuts_curve(alpha)
-            curve_sgld = sgld_curve(alpha)
-            betas_sorted = sorted(set(curve_nuts.keys()) & set(curve_sgld.keys()))
+        # plots (SGLD curve)
+        png_curve = os.path.join(args.outdir, f'curve_alpha_{str(alpha).replace(".","p")}.png')
+        a_hat, b_hat = fit_s['intercept'], -fit_s['lambda_hat']
+        plot_curve(alpha, betas_sorted, means_s, vars_s, a_hat, b_hat, png_curve)
 
-            means_n = [curve_nuts[b]['mean_nll'] for b in betas_sorted]
-            vars_n  = [curve_nuts[b]['var_of_mean'] for b in betas_sorted]
-            means_s = [curve_sgld[b]['mean_nll'] for b in betas_sorted]
-            vars_s  = [curve_sgld[b].get('var_of_mean', None) for b in betas_sorted]
+        summary[str(alpha)] = {
+            'alpha': alpha,
+            'mode': 'compare',
+            'betas': betas_sorted,
+            'nuts': {'means': means_n, 'vars': vars_n, 'wls': fit_n},
+            'sgld': {'means': means_s, 'vars': vars_s, 'wls': fit_s},
+            'delta': {'means': dels, 'vars': del_vars},
+            'curve_png': os.path.basename(png_curve),
+        }
+        alpha_list.append(alpha)
+        lambda_list.append(fit_s['lambda_hat'])
+        print(f"[CMP ] alpha={alpha:>4}: λ_sgld ≈ {fit_s['lambda_hat']:.3f}  vs  λ_nuts ≈ {fit_n['lambda_hat']:.3f}")
 
-            # fits
-            fit_n = wls_lambda(betas_sorted, means_n, vars_n)
-            fit_s = wls_lambda(betas_sorted, means_s, vars_s if all(v is not None for v in vars_s) else None)
+    return summary, alpha_list, lambda_list
 
-            # delta per beta
-            dels, del_vars = [], []
-            for i,b in enumerate(betas_sorted):
-                d = means_s[i] - means_n[i]
-                v = (vars_s[i] if vars_s[i] is not None else 0.0) + (vars_n[i] if vars_n[i] is not None else 0.0)
-                dels.append(d); del_vars.append(v if v>0 else None)
 
-            # plots
-            png_curve = os.path.join(args.outdir, f'curve_alpha_{str(alpha).replace(".","p")}.png')
-            a_hat, b_hat = fit_s['intercept'], -fit_s['lambda_hat']
-            plot_curve(alpha, betas_sorted, means_s, vars_s, a_hat, b_hat, png_curve)
+def calc_lambda(args,sampler,alphas,betas,hidden,n_per_class,std):
+    # data
+    X, y = make_gaussian_blobs(n_per_class=n_per_class, std=std, k=3, seed=42)
+    in_dim = X.shape[1]; out_dim = int(y.max().item() + 1)
+    shapes = ParamShapes(in_dim=in_dim, hidden=hidden, out_dim=out_dim)
+    return _calc_lambda(args,sampler,alphas,betas,shapes,X,y,in_dim,out_dim)
 
-            # summary
-            summary[str(alpha)] = {
-                'alpha': alpha,
-                'mode': 'compare',
-                'betas': betas_sorted,
-                'nuts': {'means': means_n, 'vars': vars_n, 'wls': fit_n},
-                'sgld': {'means': means_s, 'vars': vars_s, 'wls': fit_s},
-                'delta': {'means': dels, 'vars': del_vars},
-                'curve_png': os.path.basename(png_curve),
-            }
-            alpha_list.append(alpha); lambda_list.append(fit_s['lambda_hat'])
-            print(f"[CMP ] alpha={alpha:>4}: λ_sgld ≈ {fit_s['lambda_hat']:.3f}  vs  λ_nuts ≈ {fit_n['lambda_hat']:.3f}")
+def _calc_lambda(args,sampler,alphas,betas,shapes,X,y,in_dim,out_dim):
+    if args.sampler == "sgld":
+        return run_sgld(args, X, y, shapes, in_dim, out_dim)
+    elif args.sampler == "nuts":
+        return run_nuts(args, X, y, shapes)
+    else:
+        return run_compare(args, X, y, shapes, in_dim, out_dim)
+
+@dataclass
+class LLCConfigs:
+    seed:int=0
+    n_per_class:int=120
+    std:float=0.55
+    hidden:int=16
+    activation:str='relu' #['relu','identity']
+    alphas:list[float]=field(default_factory=lambda: [0.5, 1.0, 2.0])
+    betas:list[float]=field(default_factory=lambda: [0.1, 0.25, 0.5])
+    sigma_prior:float=5.0
+    outdir:str='out_llc_softmax'
+    # Sampler selection
+    sampler:str='sgld' #['sgld','nuts','compare']
+    # SGLD params
+    map_steps:int=400
+    sgld_steps:int=900
+    burnin_frac:float=0.6
+    sample_every:int=5
+    step_decay:float=0.9997
+    sgld_stepsize_grid:list[float]=field(default_factory=lambda: [5e-5, 2.5e-5])
+    sgld_replicates:int=3
+    sgld_estimator:str='richardson' #['smallest','richardson','linfit']
+    validate_betas:float=None #help='only with sgld: run nuts at these β to spot-check'
+    # NUTS params
+    nuts_warmup:int=600
+    nuts_samples:int=600
+    chains:int=1
+    max_tree_depth:int=8
+
+# --------------------- Main -----------------------
+def main():
+    parser = ArgumentParser(LLCConfigs)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    os.makedirs(args.outdir, exist_ok=True)
 
     # λ(α)
+    alpha_list,lambda_list,summary=calc_lambda(args.sampler,args.alphas,args.betas,args.hidden,args.n_per_class,args.std)
+    
     png_lambda = os.path.join(args.outdir, 'lambda_vs_alpha.png')
     plot_lambda_vs_alpha(alpha_list, lambda_list, png_lambda)
 

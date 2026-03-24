@@ -15,7 +15,7 @@ compare exact RCLT(Learning Coeciffient) of linear NN and nonlinear NN (softmax/
 
     outor interpolation of SGLD LLC extimation with NUTS/HMC SGLD extimaiton with pyto.
 
-- llc_training_experiment.py
+- llc_training_trajectory.py
 
     LLT selection obserbation during SGD update, small LLC saddlepoint is selected or not.
 
@@ -31,8 +31,9 @@ python estimate_softmaxDNN.py
 - [Estimating the Local Learning Coefficient](https://danmackinlay.name/notebook/estimating_llc.html)
 - [Singular Learning Theory with Daniel Murfet](https://axrp.net/episode/2024/05/07/episode-31-singular-learning-theory-dan-murfet.html)
 - [ReLUネットワークにおける局所学習係数推定手法のモデル選択への応用](https://www.jstage.jst.go.jp/article/pjsai/JSAI2025/0/JSAI2025_1S5GS201/_pdf/-char/en)
-- https://arxiv.org/abs/1806.09597
-- https://arxiv.org/abs/1704.04289
+- [Stochastic natural gradient descent draws posterior samples in function space](https://arxiv.org/abs/1806.09597)
+- [Stochastic Gradient Descent as Approximate Bayesian Inference](https://arxiv.org/abs/1704.04289)
+- [Saddle-to-Saddle Dynamics Explains A Simplicity Bias Across Neural Network Architectures](https://arxiv.org/abs/2512.20607)
 - https://github.com/suswei/RLCT
-- https://github.com/edmundlth/scalable_learning_coefficient_with_sgld/tree/v1.0MultiparamShapes.py
+- https://github.com/edmundlth/scalable_learning_coefficient_with_sgld/tree/v1.0
 
