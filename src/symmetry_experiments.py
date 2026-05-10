@@ -222,6 +222,196 @@ class DeepLinearNet(nn.Module):
             return 0.0
         return float((sv.sum()**2) / (sv**2).sum())
 
+# ── Self-Attention 専用 rank 計算 ────────────────────────────────────────────
+class AttentionRankAnalyzer:
+    """
+    nn.MultiheadAttention または同等の自前実装に対して
+    4種類のrank指標を計算する。
+
+    フック登録 → forward → compute の3ステップで使う。
+    """
+    def __init__(self, module: nn.MultiheadAttention):
+        self.module = module
+        self._attn_weights: list[torch.Tensor] = []   # (B, T, T) per forward
+        self._attn_output:  list[torch.Tensor] = []   # (B, T, d_model) per forward
+        self._hooks: list = []
+
+    def register_hooks(self) -> "AttentionRankAnalyzer":
+        """
+        nn.MultiheadAttention は need_weights=True で呼ぶと
+        attn_output_weights を返すが、forward hook では捕捉しにくい。
+        wrapper で直接差し込む。
+        """
+        original_forward = self.module.forward
+
+        def patched_forward(query, key, value, **kwargs):
+            kwargs["need_weights"] = True
+            kwargs["average_attn_weights"] = False   # ヘッド別に保持
+            out, weights = original_forward(query, key, value, **kwargs)
+            # weights: (B, num_heads, T, T)
+            if weights is not None:
+                self._attn_weights.append(weights.detach().cpu())
+            self._attn_output.append(out.detach().cpu())
+            return out, weights
+
+        self.module.forward = patched_forward
+        return self
+
+    def remove_hooks(self):
+        self.module.forward = self.module.__class__.forward.__get__(
+            self.module, self.module.__class__
+        )
+        self._attn_weights.clear()
+        self._attn_output.clear()
+
+    # ── 1. 重み行列 rank ──────────────────────────────────────────────────────
+    def weight_rank(self) -> dict[str, float]:
+        """
+        W_Q, W_K, W_V, W_O それぞれを SVD でrank推定。
+        データ不要。nn.MultiheadAttention の in_proj_weight は
+        [W_Q; W_K; W_V] が縦に並んでいる。
+        """
+        results: dict[str, float] = {}
+        d = self.module.embed_dim
+        w = self.module.in_proj_weight  # (3d, d) or None
+
+        if w is not None:
+            for name, mat in [
+                ("W_Q", w[:d]),
+                ("W_K", w[d:2*d]),
+                ("W_V", w[2*d:]),
+            ]:
+                sv = torch.linalg.svdvals(mat.float()).numpy()
+                results[name] = _stable_rank(sv)
+        else:
+            for proj, name in [
+                (self.module.q_proj_weight, "W_Q"),
+                (self.module.k_proj_weight, "W_K"),
+                (self.module.v_proj_weight, "W_V"),
+            ]:
+                if proj is not None:
+                    sv = torch.linalg.svdvals(proj.float()).numpy()
+                    results[name] = _stable_rank(sv)
+
+        if self.module.out_proj is not None:
+            sv = torch.linalg.svdvals(
+                self.module.out_proj.weight.float()
+            ).numpy()
+            results["W_O"] = _stable_rank(sv)
+
+        return results
+
+    # ── 2. Attention行列 rank（ヘッド別 + 平均）──────────────────────────────
+    def attention_matrix_rank(self) -> dict[str, float]:
+        """
+        フォワード済みの attn_weights から各ヘッドの A=(B,T,T) をまとめて SVD。
+        softmax 後の行列なので行和=1（確率行列）だが、
+        stable rank は表現ランクの近似として有効。
+
+        返値例:
+          {"head_0": 2.3, "head_1": 1.8, ..., "mean": 2.1, "nuclear": 14.2}
+        """
+        if not self._attn_weights:
+            raise RuntimeError("forward を先に実行してください")
+
+        # (total_B, num_heads, T, T)
+        A_all = torch.cat(self._attn_weights, dim=0).float()
+        num_heads = A_all.shape[1]
+        results: dict[str, float] = {}
+
+        head_ranks = []
+        for h in range(num_heads):
+            # (total_B*T, T) に reshape → バッチ方向を行方向に積む
+            A_h = A_all[:, h, :, :].reshape(-1, A_all.shape[-1])
+            sv = torch.linalg.svdvals(A_h).numpy()
+            r = _stable_rank(sv)
+            results[f"head_{h}"] = r
+            head_ranks.append(r)
+
+        results["mean"]   = float(np.mean(head_ranks))
+        results["std"]    = float(np.std(head_ranks))
+
+        # ヘッド間多様性: 全ヘッドを (num_heads*B, T, T) → 核ノルム
+        A_flat = A_all.reshape(-1, A_all.shape[-2], A_all.shape[-1])
+        A_mat  = A_flat.reshape(A_flat.shape[0], -1)   # (N, T*T)
+        sv_all = torch.linalg.svdvals(A_mat).numpy()
+        results["multi_head_diversity"] = _stable_rank(sv_all)
+
+        return results
+
+    # ── 3. 出力特徴量 rank ────────────────────────────────────────────────────
+    def output_rank(self) -> float:
+        """
+        Attention出力 (B, T, d_model) を (B*T, d_model) に展開して SVD。
+        feature_map_rank と同じ思想。
+        """
+        if not self._attn_output:
+            raise RuntimeError("forward を先に実行してください")
+
+        out = torch.cat(self._attn_output, dim=0).float()  # (total_B, T, d)
+        mat = out.reshape(-1, out.shape[-1])                # (total_B*T, d)
+        sv  = torch.linalg.svdvals(mat).numpy()
+        return _stable_rank(sv)
+
+    def compute_all(self) -> dict[str, float | dict]:
+        """全指標をまとめて返す。"""
+        result: dict = {"weight": self.weight_rank()}
+        if self._attn_weights:
+            result["attention_matrix"] = self.attention_matrix_rank()
+            result["output"]           = self.output_rank()
+        return result
+
+
+# ── モデル全体への一括適用 ────────────────────────────────────────────────────
+def attention_effective_rank(
+    model: nn.Module,
+    dataloader=None,
+    *,
+    layer_names: Optional[list[str]] = None,
+    device: str = "cpu",
+    max_batches: int = 16,
+) -> dict[str, dict]:
+    """
+    モデル内の全 nn.MultiheadAttention 層に対して rank を計算する。
+
+    dataloader=None → weight rank のみ（データ不要）
+    dataloader あり → attention_matrix / output rank も追加計算
+
+    返値:
+        {
+          "encoder.layers.0.self_attn": {
+              "weight":            {"W_Q": 6.1, "W_K": 5.8, ...},
+              "attention_matrix":  {"head_0": 2.3, ..., "mean": 2.1},
+              "output":            4.7,
+          },
+          ...
+        }
+    """
+    analyzers: dict[str, AttentionRankAnalyzer] = {}
+
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.MultiheadAttention):
+            continue
+        if layer_names is not None and name not in layer_names:
+            continue
+        a = AttentionRankAnalyzer(module)
+        if dataloader is not None:
+            a.register_hooks()
+        analyzers[name] = a
+
+    if dataloader is not None:
+        model.eval().to(device)
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if i >= max_batches:
+                    break
+                x = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
+                model(x)
+        for a in analyzers.values():
+            a.remove_hooks()
+
+    return {name: a.compute_all() for name, a in analyzers.items()}
+
 def effective_rank(
     model: nn.Module,
     method: str = "weight",
@@ -282,6 +472,8 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
                             use_layernorm = False,
                             dropout_rate = 0.1,
                             task= "regression")
+        elif(modeltype=="Attention"):
+            model = nn.Transformer(d_model=128, nhead=4, num_encoder_layers=2)
         else:
             model=SmallMLP(d,depth,d)
 
@@ -309,7 +501,14 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
                     H['train_loss'].append(loss.item())
                     H['test_loss'].append(te_loss)
                     H['singular_values'].append(sv.copy())
-                H['eff_rank'].append(effective_rank(model,method=))
+                elif(modeltype=="Attention"):
+                    # データなし → 重み行列rankのみ
+                    ranks = attention_effective_rank(model)
+                    # ranks["encoder.layers.0.self_attn"]["weight"]
+                    # → {"W_Q": 6.1, "W_K": 5.8, "W_V": 6.3, "W_O": 5.9}
+                    # データあり → attention行列・出力rankも計算
+                    ranks = attention_effective_rank(model, dataloader=train_loader, device="cuda")
+                H['eff_rank'].append(effective_rank(model,method))
                 if(calcRLCT and 
                     traj.detect_plateau(te_losses, cfg.plateau_window, cfg.plateau_thresh)):
                         alpha_list,lambda_list,summary = estimate_softmaxDNN.get_lambda_from_alphabeta(model,X_te,Y_te,args)
@@ -588,8 +787,7 @@ def make_sym_data(n=800, d=8, n_class=4, symmetry='high',
     np.random.seed(seed)
     if symmetry == 'high':
         angles = [2 * np.pi * i / n_class for i in range(n_class)]
-        centers = np.array([[3*np.cos(a), 3*np.sin(a)] + [0]*(d-2)
-                             for a in angles])
+        centers = np.array([[3*np.cos(a), 3*np.sin(a)] + [0]*(d-2) for a in angles])
     else:
         centers = np.random.randn(n_class, d) * 3
 
