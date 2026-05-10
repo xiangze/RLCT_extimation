@@ -26,7 +26,7 @@ import RLCT_helper
 import estimate_softmaxDNN 
 import llc_training_trajectory as traj
 from estimate_softmaxDNN  import LLCConfigs 
-
+from models import FlexibleCNN, SmallMLP
 # 日本語フォント
 try:
     plt.rcParams['font.family'] = 'IPAexGothic'
@@ -72,6 +72,125 @@ def make_low_rank_data(n=300, d=10, rank=2, noise=0.02, seed=42):
     n_tr = int(n * 0.7)
     return (X[:n_tr], Y[:n_tr], X[n_tr:], Y[n_tr:], W_true)
 
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Optional
+
+
+def _stable_rank(sv: np.ndarray) -> float:
+    """Stable rank = (‖σ‖₁)² / ‖σ‖₂²  (= effective_rank in original code)"""
+    sv = sv[sv > 1e-8]
+    if len(sv) == 0:
+        return 0.0
+    return float((sv.sum() ** 2) / (sv ** 2).sum())
+
+
+# ── 1. Jacobian rank ──────────────────────────────────────────────────────────
+def jacobian_effective_rank(
+    model: nn.Module,
+    input_shape: tuple,
+    device: str = "cpu",
+    n_samples: int = 8,
+) -> float:
+    """
+    入力に対する出力のヤコビアン行列を数値的に構築し SVD でランク推定。
+    - 最も理論的に正確（線形モデルの product_matrix に相当）
+    - CNNの入出力次元が大きい場合はメモリ集中に注意
+    
+    Args:
+        input_shape: バッチ次元を除いた入力形状 e.g. (3, 32, 32)
+        n_samples:   ランダム入力を何サンプル平均するか
+    """
+    model.eval().to(device)
+    all_sv = []
+
+    for _ in range(n_samples):
+        x = torch.randn(1, *input_shape, device=device, requires_grad=True)
+        y = model(x)
+        out_dim = y.numel()
+        in_dim  = x.numel()
+
+        J = torch.zeros(out_dim, in_dim, device=device)
+        for i in range(out_dim):
+            if x.grad is not None:
+                x.grad.zero_()
+            y.flatten()[i].backward(retain_graph=(i < out_dim - 1))
+            J[i] = x.grad.detach().flatten()
+
+        sv = torch.linalg.svdvals(J).cpu().numpy()
+        all_sv.append(sv)
+
+    sv_mean = np.stack(all_sv).mean(axis=0)
+    return _stable_rank(sv_mean)
+
+# ── 2. Feature map rank ───────────────────────────────────────────────────────
+def featuremap_effective_rank(
+    model: nn.Module,
+    dataloader,                      # 実データ or ダミーバッチのイテレータ
+    layer_names: Optional[list] = None,
+    device: str = "cpu",
+    max_batches: int = 16,
+) -> dict[str, float]:
+    """
+    各中間層の出力特徴マップを (N, C*H*W) に展開して SVD でランク推定。
+    - layer_names=None の場合 Conv2d / Linear 直後を全フック
+    - 返値: {"layer_name": effective_rank, ...}
+    """
+    model.eval().to(device)
+    activations: dict[str, list[torch.Tensor]] = {}
+    hooks = []
+
+    def _make_hook(name: str):
+        def hook(module, inp, out):
+            activations[name].append(out.detach().cpu().flatten(1))  # (N, *)
+        return hook
+
+    for name, module in model.named_modules():
+        if layer_names is not None and name not in layer_names:
+            continue
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            activations[name] = []
+            hooks.append(module.register_forward_hook(_make_hook(name)))
+
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= max_batches:
+                break
+            x = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
+            model(x)
+
+    for h in hooks:
+        h.remove()
+
+    results: dict[str, float] = {}
+    for name, acts in activations.items():
+        if not acts:
+            continue
+        mat = torch.cat(acts, dim=0).float()   # (total_N, features)
+        sv  = torch.linalg.svdvals(mat).numpy()
+        results[name] = _stable_rank(sv)
+    return results
+
+# ── 3. Weight filter rank ─────────────────────────────────────────────────────
+def weight_effective_rank(model: nn.Module) -> dict[str, float]:
+    """
+    各 Conv2d の重みを (C_out, C_in * kH * kW) に reshape して SVD。
+    データ不要・高速。ただし「実際の表現ランク」より近似的。
+    - 返値: {"layer_name": effective_rank, ...}
+    """
+    results: dict[str, float] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            w = module.weight.detach().flatten(1).float()  # (C_out, C_in*kH*kW)
+            sv = torch.linalg.svdvals(w).numpy()
+            results[name] = _stable_rank(sv)
+        elif isinstance(module, nn.Linear):
+            w = module.weight.detach().float()
+            sv = torch.linalg.svdvals(w).numpy()
+            results[name] = _stable_rank(sv)
+    return results
+
 class DeepLinearNet(nn.Module):
     def __init__(self, d, depth=3, init_scale=0.01):
         """
@@ -103,9 +222,44 @@ class DeepLinearNet(nn.Module):
             return 0.0
         return float((sv.sum()**2) / (sv**2).sum())
 
+def effective_rank(
+    model: nn.Module,
+    method: str = "weight",
+    *,
+    # jacobian / featuremap 用
+    input_shape: tuple | None = None,
+    dataloader=None,
+    layer_names: list | None = None,
+    device: str = "cuda",
+) -> float | dict[str, float]:
+    """
+    統一インターフェース。
+
+    Args:
+        method: "weight"     → weight_effective_rank（データ不要）
+                "featuremap" → featuremap_effective_rank（dataloader必須）
+                "jacobian"   → jacobian_effective_rank（input_shape必須）
+    Returns:
+        "weight" / "jacobian": モデル全体のスカラー or 層別dict
+        "featuremap": 層別dict {layer_name: rank}
+    """
+    if isinstance(model, DeepLinearNet):
+        return model.effective_rank()
+
+    if method == "weight":
+        return weight_effective_rank(model)
+    elif method == "featuremap":
+        assert dataloader is not None, "featuremap method requires dataloader"
+        return featuremap_effective_rank(model, dataloader, layer_names, device)
+    elif method == "jacobian":
+        assert input_shape is not None, "jacobian method requires input_shape"
+        return jacobian_effective_rank(model, input_shape, device)
+    else:
+        raise ValueError(f"Unknown method: {method!r}. Choose weight / featuremap / jacobian")
+    
 
 def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
-              lr=0.005, log_every=100,calcRLCT=True):
+              lr=0.005, log_every=100,modeltype="linearr",calcRLCT=True):
     """
     実験A: 深さを変えて段階的特異値獲得を観測
 
@@ -114,11 +268,23 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
     X_tr, Y_tr, X_te, Y_te, W_true = make_low_rank_data(d=d, rank=rank)
     results = {}
     
-    in_dim=args.in_dim
-    out_dim=args.out_dim
-
     for depth in depths:
-        model = DeepLinearNet(d, depth=depth)
+        if(modeltype=="linear"):
+            model = DeepLinearNet(d, depth=depth)
+        elif(modeltype=="CNN"):
+            model=FlexibleCNN(
+                            in_channels = d,
+                            num_classes = d,
+                            base_channels = 32,
+                            num_layers = depth,
+                            use_resnet = False,
+                            use_unet = False,
+                            use_layernorm = False,
+                            dropout_rate = 0.1,
+                            task= "regression")
+        else:
+            model=SmallMLP(d,depth,d)
+
         opt = torch.optim.SGD(model.parameters(), lr=lr)
         loss_fn = nn.MSELoss()
 
@@ -137,15 +303,16 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
                 with torch.no_grad():
                     te_loss = loss_fn(model(X_te), Y_te).item()
                     te_losses.append(te_loss)
-                sv = torch.linalg.svdvals(model.product_matrix()).numpy()
-                H['step'].append(step)
-                H['train_loss'].append(loss.item())
-                H['test_loss'].append(te_loss)
-                H['singular_values'].append(sv.copy())
-                H['eff_rank'].append(model.effective_rank())
+                if(modeltype=="linear"):
+                    sv = torch.linalg.svdvals(model.product_matrix()).numpy()
+                    H['step'].append(step)
+                    H['train_loss'].append(loss.item())
+                    H['test_loss'].append(te_loss)
+                    H['singular_values'].append(sv.copy())
+                H['eff_rank'].append(effective_rank(model,method=))
                 if(calcRLCT and 
                     traj.detect_plateau(te_losses, cfg.plateau_window, cfg.plateau_thresh)):
-                        alpha_list,lambda_list,summary = estimate_softmaxDNN.get_lambda_from_alphabeta(model,args,in_dim,out_dim)
+                        alpha_list,lambda_list,summary = estimate_softmaxDNN.get_lambda_from_alphabeta(model,X_te,Y_te,args)
                         llc_val=[alpha_list,lambda_list]
                         H["llc"].append(llc_val)
                         print(f"[step {step:03d}] Estimated LLC (slope) = {llc_val:.4f}")
@@ -708,8 +875,6 @@ def main():
         cfg=LLCConfigs()
         depths=[4,5,6]
         banner("Experiment A: Deep Linear Network — Staged SV Acquisition")
-        dims=10    
-        in_dim=out_dim=dims
         results_A = run_exp_A(args,cfg,d=10, depths=depths, rank=2, n_steps=12000)
         plot_exp_A(results_A, depths, rank=2,
                    outfile=f'{args.outdir}/exp_A_deep_linear.png')
