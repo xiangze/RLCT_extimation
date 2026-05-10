@@ -29,7 +29,7 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict,field
 from typing import Dict, List, Optional, Tuple
 import csv
 import numpy as np
@@ -393,11 +393,11 @@ class TrainConfig:
 
 @dataclass
 class TrainLog:
-    epochs:list = []
-    train_losses:list = []
-    test_losses:list = []
-    metrics:list = []
-    llc_values:list = []
+    epochs:list[int] = field(default_factory=list)
+    train_losses:list[float] = field(default_factory=list)
+    test_losses:list[float] = field(default_factory=list)
+    metrics:list[float] = field(default_factory=list)
+    llc_values:list[float] = field(default_factory=list)
     def append_train(self,e,tr,test,me):
         self.epochs.append(e)
         self.train_losses.append(tr)

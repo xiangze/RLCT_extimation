@@ -27,6 +27,7 @@ import estimate_softmaxDNN
 import llc_training_trajectory as traj
 from estimate_softmaxDNN  import LLCConfigs 
 from models import FlexibleCNN, SmallMLP
+import itertools
 # 日本語フォント
 try:
     plt.rcParams['font.family'] = 'IPAexGothic'
@@ -190,7 +191,7 @@ def weight_effective_rank(model: nn.Module) -> dict[str, float]:
             sv = torch.linalg.svdvals(w).numpy()
             results[name] = _stable_rank(sv)
     return results
-
+## ------DeepLinearNet--------------------------------------------------------------------
 class DeepLinearNet(nn.Module):
     def __init__(self, d, depth=3, init_scale=0.01):
         """
@@ -204,10 +205,10 @@ class DeepLinearNet(nn.Module):
         for layer in self.layers:
             nn.init.normal_(layer.weight, std=init_scale)
 
-    def forward(self, x):
+    def forward(self, x,alpha: float = 1.0):
         for l in self.layers:
             x = l(x)
-        return x
+        return x*alpha
 
     def product_matrix(self):
         W = self.layers[0].weight
@@ -448,8 +449,8 @@ def effective_rank(
         raise ValueError(f"Unknown method: {method!r}. Choose weight / featuremap / jacobian")
     
 
-def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
-              lr=0.005, log_every=100,modeltype="linearr",calcRLCT=True):
+def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
+              lr=0.005, log_every=100,modeltype="linear",method="",calcRLCT=True):
     """
     実験A: 深さを変えて段階的特異値獲得を観測
 
@@ -480,8 +481,7 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
         opt = torch.optim.SGD(model.parameters(), lr=lr)
         loss_fn = nn.MSELoss()
 
-        H = dict(step=[], train_loss=[], test_loss=[],
-                 singular_values=[], eff_rank=[],llc=[])
+        H = dict(step=[], train_loss=[], test_loss=[], singular_values=[], eff_rank=[],llc=[])
         
         llc_val = float("nan")
         te_losses=[]
@@ -495,23 +495,24 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
                 with torch.no_grad():
                     te_loss = loss_fn(model(X_te), Y_te).item()
                     te_losses.append(te_loss)
-                if(modeltype=="linear"):
-                    sv = torch.linalg.svdvals(model.product_matrix()).numpy()
+                if(modeltype=="linear" or modeltype=="CNN"):
                     H['step'].append(step)
                     H['train_loss'].append(loss.item())
                     H['test_loss'].append(te_loss)
-                    H['singular_values'].append(sv.copy())
+                    if(modeltype=="linear"):
+                        sv = torch.linalg.svdvals(model.product_matrix()).numpy()
+                        H['singular_values'].append(sv.copy())
+                    H['eff_rank'].append(effective_rank(model,method))
                 elif(modeltype=="Attention"):
-                    # データなし → 重み行列rankのみ
-                    ranks = attention_effective_rank(model)
-                    # ranks["encoder.layers.0.self_attn"]["weight"]
-                    # → {"W_Q": 6.1, "W_K": 5.8, "W_V": 6.3, "W_O": 5.9}
-                    # データあり → attention行列・出力rankも計算
-                    ranks = attention_effective_rank(model, dataloader=train_loader, device="cuda")
-                H['eff_rank'].append(effective_rank(model,method))
-                if(calcRLCT and 
-                    traj.detect_plateau(te_losses, cfg.plateau_window, cfg.plateau_thresh)):
-                        alpha_list,lambda_list,summary = estimate_softmaxDNN.get_lambda_from_alphabeta(model,X_te,Y_te,args)
+                    if(method=="featuremap"):  # データなし → 重み行列rankのみ
+                        H['eff_rank'].append(attention_effective_rank(model))
+                        # ranks["encoder.layers.0.self_attn"]["weight"]→ {"W_Q": 6.1, "W_K": 5.8, "W_V": 6.3, "W_O": 5.9}
+                    else: # データあり → attention行列・出力rankも計算
+                        H['eff_rank'].append(attention_effective_rank(model, dataloader=X_te, device="cuda"))
+                else:
+                    raise ValueError(f"Unsuppoted network: {modeltype!r}. Choose CNN / linear / Attentiion")
+                if(calcRLCT and traj.detect_plateau(te_losses, cfg.plateau_window, cfg.plateau_thresh)):
+                        alpha_list,lambda_list,summary = estimate_softmaxDNN.get_lambda_from_alphabeta(model,X_te,Y_te,cfg)
                         llc_val=[alpha_list,lambda_list]
                         H["llc"].append(llc_val)
                         print(f"[step {step:03d}] Estimated LLC (slope) = {llc_val:.4f}")
@@ -521,7 +522,6 @@ def run_exp_A(args,cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000
         print(f"  depth={depth}: eff_rank={H['eff_rank'][-1]:.2f}  "
               f"sv=[{final[0]:.3f}, {final[1]:.3f}, {final[2]:.4f}...]  "
               f"tr_loss={H['train_loss'][-1]:.5f}")
-
     return results
 
 def plot_exp_A(results, depths, rank, outfile):
@@ -606,7 +606,6 @@ def plot_exp_A(results, depths, rank, outfile):
     plt.close()
     print(f"  Saved: {outfile}")
 
-
 # ==============================================================================
 # 実験 B: グロッキング — 対称性獲得と汎化の相転移
 # ==============================================================================
@@ -630,7 +629,6 @@ def plot_exp_A(results, depths, rank, outfile):
 #   → 汎化時に埋め込みベクトルがFourier成分に集中する
 #   → これが「対称性獲得」の定量的指標
 # ==============================================================================
-
 class GrokMLP(nn.Module):
     """グロッキング実験用MLP（標準設定）"""
     def __init__(self, p, d_emb=64, d_hidden=256):
@@ -656,13 +654,10 @@ class GrokMLP(nn.Module):
 
 def make_grok_data(p=23, train_frac=0.4, seed=0):
     torch.manual_seed(seed)
-    pairs = torch.tensor([(a, b, (a+b) % p)
-                          for a in range(p) for b in range(p)],
-                         dtype=torch.long)
+    pairs = torch.tensor([(a, b, (a+b) % p) for a in range(p) for b in range(p)], dtype=torch.long)
     idx = torch.randperm(len(pairs))
     n_tr = int(len(pairs) * train_frac)
     return pairs[idx[:n_tr]], pairs[idx[n_tr:]]
-
 
 def run_exp_B(p=23, train_frac=0.4,
               weight_decays=(0.0, 1.0, 5.0),
@@ -710,11 +705,8 @@ def run_exp_B(p=23, train_frac=0.4,
                 if ep % (log_every * 10) == 0:
                     print(f"  {label} ep={ep:6d}: "
                           f"tr={tr_acc:.3f} te={te_acc:.3f} fc={fc:.3f}")
-
         results[label] = H
-
     return results
-
 
 def plot_exp_B(results, outfile):
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
@@ -734,25 +726,20 @@ def plot_exp_B(results, outfile):
         # train accuracy
         axes[1].plot(epochs, H['tr_acc'], color=c, lw=2, label=label)
         # fourier vs test acc trajectory
-        axes[2].scatter(H['fourier'], H['te_acc'],
-                        c=epochs, cmap='viridis', s=8, alpha=0.6)
+        axes[2].scatter(H['fourier'], H['te_acc'], c=epochs, cmap='viridis', s=8, alpha=0.6)
         axes[2].annotate('',
             xy=(H['fourier'][-1], H['te_acc'][-1]),
             xytext=(H['fourier'][0], H['te_acc'][0]),
             arrowprops=dict(arrowstyle='->', color=c, lw=2))
 
-    axes[0].set(title='Test accuracy (generalization)',
-                xlabel='epoch', ylabel='accuracy')
+    axes[0].set(title='Test accuracy (generalization)', xlabel='epoch', ylabel='accuracy')
     axes[0].legend(fontsize=9)
-    axes[1].set(title='Train accuracy (memorization)',
-                xlabel='epoch', ylabel='accuracy')
+    axes[1].set(title='Train accuracy (memorization)', xlabel='epoch', ylabel='accuracy')
     axes[1].legend(fontsize=9)
     axes[2].set(title='Fourier concentration vs test acc\n(arrow = time, each point = checkpoint)',
                 xlabel='Fourier concentration (symmetry)',
                 ylabel='test accuracy')
-    plt.colorbar(plt.cm.ScalarMappable(cmap='viridis'),
-                 ax=axes[2], label='epoch')
-
+    plt.colorbar(plt.cm.ScalarMappable(cmap='viridis'), ax=axes[2], label='epoch')
     plt.tight_layout()
     plt.savefig(outfile, dpi=150, bbox_inches='tight')
     plt.close()
@@ -777,7 +764,6 @@ def plot_exp_B(results, outfile):
 #   - 学習率崩壊後の過学習度合い
 #   - 重みのスペクトル集中度
 # ==============================================================================
-
 def make_sym_data(n=800, d=8, n_class=4, symmetry='high',
                   noise=0.4, seed=42):
     """
@@ -804,7 +790,6 @@ def make_sym_data(n=800, d=8, n_class=4, symmetry='high',
     n_tr = int(len(y) * 0.6)
     return X[:n_tr], y[:n_tr], X[n_tr:], y[n_tr:]
 
-
 class WideMLP(nn.Module):
     def __init__(self, d_in, n_class, width, depth=3):
         super().__init__()
@@ -826,7 +811,6 @@ class WideMLP(nn.Module):
                 if sv.sum() > 0:
                     ratios.append(sv.max() / sv.mean())
         return float(np.mean(ratios)) if ratios else 0.0
-
 
 def run_exp_C(configs, n_epochs=2000, lr=1e-3, wd=1e-3, log_every=100):
     """
@@ -1055,13 +1039,15 @@ def plot_exp_D(results, outfile):
 # ==============================================================================
 # メイン
 # ==============================================================================
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp', default='A', choices=['A', 'B', 'C', 'D', 'all'])
     parser.add_argument('--outdir', default='/mnt/user-data/outputs')
     parser.add_argument('--in_dim', type=int,default=10)
     parser.add_argument('--out_dim', type=int,default=10)
+    parser.add_argument('--all', action="store_true")
+    parser.add_argument('--regression', action="store_true")
+    #parser.add_argument('--alphas', type=float,default=1,)
     args = parser.parse_args()
     
     run_A = args.exp in ('A', 'all')
@@ -1070,26 +1056,30 @@ def main():
     run_D = args.exp in ('D', 'all')
 
     if run_A:
-        cfg=LLCConfigs()
-        depths=[4,5,6]
         banner("Experiment A: Deep Linear Network — Staged SV Acquisition")
-        results_A = run_exp_A(args,cfg,d=10, depths=depths, rank=2, n_steps=12000)
-        plot_exp_A(results_A, depths, rank=2,
-                   outfile=f'{args.outdir}/exp_A_deep_linear.png')
-
+        depths=[4,5,6]
+        cfg=LLCConfigs()
+        #cfg.alphas=[0,5,1.,2.]
+        print(cfg)
+        if(args.regression):
+            print("regression")
+            for plateau_window,plateau_thresh,method,modeltype in itertools.product(
+                    [1,10,100],[0.01,0.1,1],["weight","featuremap","jacobian"],["linear","CNN","Attention"]):
+                    cfg.plateau_thresh=plateau_thresh
+                    cfg.plateau_window=plateau_window
+                    results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=12000, modeltype=modeltype,method=method)
+                    plot_exp_A(results_A, depths, rank=2,outfile=f'{args.outdir}/exp_A_deep_{modeltype}_{method}.png')
+        else:
+            results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=12000)
+            plot_exp_A(results_A, depths, rank=2, outfile=f'{args.outdir}/exp_A_deep_linear.png')
     if run_B:
         banner("Experiment B: Grokking — Symmetry Acquisition")
         print("NOTE: Requires ~100k steps to observe grokking. Set n_epochs accordingly.")
-        results_B = run_exp_B(
-            p=23, weight_decays=[0.0, 1.0, 5.0],
-            n_epochs=5000,   # 本番は100000推奨。短いと汎化未観測
-        )
-        plot_exp_B(results_B, outfile=f'{args.outdir}/exp_B_grokking.png')
-
+        n_epochs=5000 # 本番は100000推奨。短いと汎化未観測
+        results_B = run_exp_B( p=23, weight_decays=[0.0, 1.0, 5.0],n_epochs=n_epochs)
+        plot_exp_B(results_B, outfile=f'{args.outdir}/exp_B_grokking_{n_epochs}.png')
     if run_C:
-        print("\n" + "="*60)
-        print("Experiment C: Data-Network Symmetry Mismatch")
-        print("="*60)
+        banner("Experiment C: Data-Network Symmetry Mismatch")
         configs_C = [
             dict(sym='high', width=256, label='High sym + wide NW',  color='#1D9E75', ls='-'),
             dict(sym='low',  width=256, label='Low sym  + wide NW',  color='#E8593C', ls='-'),
@@ -1097,18 +1087,12 @@ def main():
             dict(sym='low',  width=16,  label='Low sym  + narrow NW',color='#EF9F27', ls='--'),
         ]
         results_C = run_exp_C(configs_C, n_epochs=3000)
-        plot_exp_C(results_C, configs_C,
-                   outfile=f'{args.outdir}/exp_C_symmetry.png')
-
+        plot_exp_C(results_C, configs_C,outfile=f'{args.outdir}/exp_C_symmetry.png')
     if run_D:
-        print("\n" + "="*60)
-        print("Experiment D: Stochastic Collapse")
-        print("="*60)
+        banner("Experiment D: Stochastic Collapse")
         results_D = run_exp_D(batch_sizes=[8, 64, 512], n_epochs=3000)
         plot_exp_D(results_D, outfile=f'{args.outdir}/exp_D_collapse.png')
-
     print("\nAll done.")
-
 
 if __name__ == '__main__':
     main()

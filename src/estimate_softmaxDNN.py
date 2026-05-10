@@ -178,13 +178,11 @@ def plot_lambda_vs_alpha(alphas: List[float], lambdas: List[float], out_png: str
     plt.tight_layout()
     plt.savefig(out_png); plt.close()
 
-def get_lambda_from_alphabeta(model,args,in_dim,out_dim,plot=True):
+def get_lambda_from_alphabeta(model,X,y,args,plot=True):
     alpha_list, lambda_list=[],[]
     summary = {}
     for alpha in args.alphas:
-        #base = SmallMLP(in_dim, args.hidden, out_dim)
-        base=model(in_dim, args.hidden, out_dim)
-        fit_map(base, X, y, alpha=alpha, sigma_prior=args.sigma_prior, steps=args.map_steps)
+        fit_map(model, X, y, alpha=alpha, sigma_prior=args.sigma_prior, steps=args.map_steps)
 
         curve = {}
         for beta in args.betas:
@@ -198,7 +196,7 @@ def get_lambda_from_alphabeta(model,args,in_dim,out_dim,plot=True):
                 alpha=alpha,
                 step_decay=args.step_decay,
             )
-            stat = sgld_sample(base, X, y, cfg)
+            stat = sgld_sample(model, X, y, cfg)
             curve[float(beta)] = stat
 
         betas_sorted = sorted(curve.keys())
@@ -253,18 +251,18 @@ def main():
     X, y = make_gaussian_blobs(n_per_class=args.n_per_class, std=args.std, k=3, seed=42)
     in_dim = X.shape[1]; out_dim = int(y.max().item() + 1)
     model=models.FlexibleCNN(
-                            in_channels = 1,
-                            num_classes = k,
+                            in_channels = in_dim,
+                            num_classes = out_dim,
                             base_channels = 32,
-                            num_layers = 4,
+                            num_layers = args.hidden,
                             use_resnet = False,
                             dropout_rate = 0.1,
                             use_unet = False,
                             use_layernorm = False,
                             task= "classification", )
-
+    #model =SmallMLP(in_dim, args.hidden, out_dim)
     # storage
-    alpha_list, lambda_list,summary = get_lambda_from_alphabeta(model,args,in_dim,out_dim)
+    alpha_list, lambda_list,summary = get_lambda_from_alphabeta(model,X,y,args)
 
     # λ vs α plot
     png_lambda = os.path.join(args.outdir, 'lambda_vs_alpha.png')
