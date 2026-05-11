@@ -301,7 +301,7 @@ class FlexibleCNN(nn.Module):
                 nn.Linear(256, num_classes),
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
         skips = []
 
         # エンコーダ
@@ -321,7 +321,7 @@ class FlexibleCNN(nn.Module):
                 return self.seg_head(x)
 
         # 分類
-        return self.classifier(self.global_pool(x))
+        return alpha*self.classifier(self.global_pool(x))
 
 
 # ---------------------------------------------------------------------------
