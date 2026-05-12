@@ -25,9 +25,11 @@ import matplotlib.gridspec as gridspec
 import RLCT_helper
 import estimate_softmaxDNN 
 import llc_training_trajectory as traj
-from estimate_softmaxDNN  import LLCConfigs 
+from estimate_softmaxDNN  import Dataset,LLCConfigs ,LLCEstimator_simple,GaussianBlobDataset
 from models import FlexibleCNN, SmallMLP
 import itertools
+from dataclasses import dataclass, field
+from pathlib import Path
 # 日本語フォント
 try:
     plt.rcParams['font.family'] = 'IPAexGothic'
@@ -62,16 +64,19 @@ def banner(s,n=60):
 #   低ランク解 = 少ない有効パラメータ = 暗黙的正則化 = 過学習しにくい
 # ==============================================================================
 
-def make_low_rank_data(n=300, d=10, rank=2, noise=0.02, seed=42):
+def make_low_rank_data(n=300, d=10, rank=2, noise=0.02, seed=42,mode="Gaussian"):
     """真の写像がrank行列であるデータを生成（過剰パラメータ設定）"""
     torch.manual_seed(seed)
+#    if(mode=="random"):
     U = torch.randn(d, rank)
     V = torch.randn(rank, d)
     W_true = U @ V / rank**0.5
     X = torch.randn(n, d)
     Y = X @ W_true.T + noise * torch.randn(n, d)
     n_tr = int(n * 0.7)
-    return (X[:n_tr], Y[:n_tr], X[n_tr:], Y[n_tr:], W_true)
+    train=Dataset(X[:n_tr], Y[:n_tr])
+    test=Dataset(X[n_tr:], Y[n_tr:])
+    return (train,test, W_true)
 
 import torch
 import torch.nn as nn
@@ -450,15 +455,18 @@ def effective_rank(
     
 
 def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
-              lr=0.005, log_every=100,modeltype="linear",method="",calcRLCT=True):
+              lr=0.005, log_every=100,modeltype="linear",
+              alphas=[0.5, 1.0, 2.0, 5.],betas=[0.1, 0.25, 0.5,2],
+              method="",calcRLCT=True):
     """
     実験A: 深さを変えて段階的特異値獲得を観測
 
     Returns: dict of {depth: history}
     """
-    X_tr, Y_tr, X_te, Y_te, W_true = make_low_rank_data(d=d, rank=rank)
+    train, test, W_true = make_low_rank_data(d=d, rank=rank)
+    X_tr, Y_tr=train.X,train.Y
+    X_te, Y_te=test.X,test.Y
     results = {}
-    
     for depth in depths:
         if(modeltype=="linear"):
             model = DeepLinearNet(d, depth=depth)
@@ -478,6 +486,8 @@ def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
         else:
             model=SmallMLP(d,depth,d)
 
+        if(calcRLCT):
+            LLCestimator=LLCEstimator_simple(cfg,model,test,betas,outdir=Path("results"))
         opt = torch.optim.SGD(model.parameters(), lr=lr)
         loss_fn = nn.MSELoss()
 
@@ -500,9 +510,17 @@ def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
                     H['train_loss'].append(loss.item())
                     H['test_loss'].append(te_loss)
                     if(modeltype=="linear"):
-                        sv = torch.linalg.svdvals(model.product_matrix()).numpy()
-                        H['singular_values'].append(sv.copy())
-                    H['eff_rank'].append(effective_rank(model,method))
+                        try:
+                            sv = torch.linalg.svdvals(model.product_matrix()).numpy()
+                            H['singular_values'].append(sv.copy())
+                        except Exception as e:
+                            print(f"{e}")
+                            H['singular_values'].append(None)
+                    try:
+                        H['eff_rank'].append(effective_rank(model,method))
+                    except Exception as e:
+                        print(f"{e},{modeltype}, {method}")
+                        H['eff_rank'].append(-1)
                 elif(modeltype=="Attention"):
                     if(method=="featuremap"):  # データなし → 重み行列rankのみ
                         H['eff_rank'].append(attention_effective_rank(model))
@@ -512,11 +530,11 @@ def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
                 else:
                     raise ValueError(f"Unsuppoted network: {modeltype!r}. Choose CNN / linear / Attentiion")
                 if(calcRLCT and traj.detect_plateau(te_losses, cfg.plateau_window, cfg.plateau_thresh)):
-                        alpha_list,lambda_list,summary = estimate_softmaxDNN.get_lambda_from_alphabeta(model,X_te,Y_te,cfg)
+                        alpha_list,lambda_list,summary = LLCestimator.run(alphas)
                         llc_val=[alpha_list,lambda_list]
                         H["llc"].append(llc_val)
-                        print(f"[step {step:03d}] Estimated LLC (slope) = {llc_val:.4f}")
-                results[depth] = H
+                        print(f"[step {step:03d}] Estimated LLC (slope) = {alpha_list},{lambda_list}")
+        results[depth] = H
 
         final = H['singular_values'][-1]
         print(f"  depth={depth}: eff_rank={H['eff_rank'][-1]:.2f}  "
@@ -1059,14 +1077,13 @@ def main():
         banner("Experiment A: Deep Linear Network — Staged SV Acquisition")
         depths=[4,5,6]
         cfg=LLCConfigs()
-        #cfg.alphas=[0,5,1.,2.]
         print(cfg)
         if(args.regression):
             print("regression")
             for plateau_window,plateau_thresh,method,modeltype in itertools.product(
                     [1,10,100],[0.01,0.1,1],["weight","featuremap","jacobian"],["linear","CNN","Attention"]):
-                    cfg.plateau_thresh=plateau_thresh
                     cfg.plateau_window=plateau_window
+                    cfg.plateau_thresh=plateau_thresh
                     results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=12000, modeltype=modeltype,method=method)
                     plot_exp_A(results_A, depths, rank=2,outfile=f'{args.outdir}/exp_A_deep_{modeltype}_{method}.png')
         else:
