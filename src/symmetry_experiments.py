@@ -30,6 +30,7 @@ from models import FlexibleCNN, SmallMLP
 import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 # 日本語フォント
 try:
     plt.rcParams['font.family'] = 'IPAexGothic'
@@ -44,6 +45,10 @@ def banner(s,n=60):
     print(s)
     print("="*n)
 
+def dprint(s,fp=None):
+    print(s)
+    if(not fp is None):
+        print(s,file=fp)
 # ==============================================================================
 # 実験 A: 深線形NN — 段階的特異値獲得 (Saddle-to-Saddle)
 # ==============================================================================
@@ -457,7 +462,7 @@ def effective_rank(
 def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
               lr=0.005, log_every=100,modeltype="linear",
               alphas=[0.5, 1.0, 2.0, 5.],betas=[0.1, 0.25, 0.5,2],
-              method="",calcRLCT=True):
+              method="",calcRLCT=True,fpw=None):
     """
     実験A: 深さを変えて段階的特異値獲得を観測
 
@@ -514,12 +519,12 @@ def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
                             sv = torch.linalg.svdvals(model.product_matrix()).numpy()
                             H['singular_values'].append(sv.copy())
                         except Exception as e:
-                            print(f"{e}")
-                            H['singular_values'].append(None)
+                            dprint(f"{e},method",fpw)
+                            H['singular_values'].append("None")
                     try:
                         H['eff_rank'].append(effective_rank(model,method))
                     except Exception as e:
-                        print(f"{e},{modeltype}, {method}")
+                        dprint(f"{e},{modeltype}, {method}",fpw)
                         H['eff_rank'].append(-1)
                 elif(modeltype=="Attention"):
                     if(method=="featuremap"):  # データなし → 重み行列rankのみ
@@ -536,10 +541,15 @@ def run_exp_A(cfg:LLCConfigs, d=10, depths=(2, 3, 4), rank=2, n_steps=12000,
                         print(f"[step {step:03d}] Estimated LLC (slope) = {alpha_list},{lambda_list}")
         results[depth] = H
 
-        final = H['singular_values'][-1]
-        print(f"  depth={depth}: eff_rank={H['eff_rank'][-1]:.2f}  "
-              f"sv=[{final[0]:.3f}, {final[1]:.3f}, {final[2]:.4f}...]  "
-              f"tr_loss={H['train_loss'][-1]:.5f}")
+        finalsv = H['singular_values'][-1]
+        try:
+            s=f"sv=[{finalsv[0]:.3f}, {finalsv[1]:.3f}, {finalsv[2]:.4f}...]  "
+        except:
+            s=""
+        dprint(f"  depth={depth}: eff_rank={H['eff_rank'][-1]:.2f} "+s+f"tr_loss={H['train_loss'][-1]:.5f}",fpw)
+
+    with open("results_expA.json","w") as fp:
+        json.dump(results,fp)
     return results
 
 def plot_exp_A(results, depths, rank, outfile):
@@ -898,8 +908,7 @@ def plot_exp_C(results, configs, outfile):
     axes[1,2].bar(x - 0.2, final_tr, 0.35, color=colors_C, alpha=0.5, label='train')
     axes[1,2].bar(x + 0.2, final_te, 0.35, color=colors_C, alpha=1.0, label='test')
     axes[1,2].set_xticks(x)
-    axes[1,2].set_xticklabels([c['label'].replace(' + ', '\n') for c in configs],
-                               fontsize=7)
+    axes[1,2].set_xticklabels([c['label'].replace(' + ', '\n') for c in configs], fontsize=7)
     axes[1,2].legend(fontsize=8)
     axes[1,2].set_ylim(0, 1.1)
 
@@ -980,8 +989,7 @@ class TeacherStudentSetup:
         return 1.0 - avg_sim.item()   # 1=全部異なる, 0=全部同一
 
 
-def run_exp_D(batch_sizes=(8, 64, 512), n_epochs=3000,
-              lr=1e-3, log_every=100):
+def run_exp_D(batch_sizes=(8, 64, 512), n_epochs=3000, lr=1e-3, log_every=100):
     """
     実験D: バッチサイズ（=SGDノイズ）とニューロン多様性・汎化
     """
@@ -1060,12 +1068,12 @@ def plot_exp_D(results, outfile):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp', default='A', choices=['A', 'B', 'C', 'D', 'all'])
-    parser.add_argument('--outdir', default='/mnt/user-data/outputs')
+    parser.add_argument('--outdir', default='results')
     parser.add_argument('--in_dim', type=int,default=10)
     parser.add_argument('--out_dim', type=int,default=10)
+    parser.add_argument('--n_epochs', type=int,default=5000)# expB 本番は100000推奨。短いと汎化未観測
     parser.add_argument('--all', action="store_true")
     parser.add_argument('--regression', action="store_true")
-    #parser.add_argument('--alphas', type=float,default=1,)
     args = parser.parse_args()
     
     run_A = args.exp in ('A', 'all')
@@ -1078,23 +1086,26 @@ def main():
         depths=[4,5,6]
         cfg=LLCConfigs()
         print(cfg)
-        if(args.regression):
-            print("regression")
-            for plateau_window,plateau_thresh,method,modeltype in itertools.product(
-                    [1,10,100],[0.01,0.1,1],["weight","featuremap","jacobian"],["linear","CNN","Attention"]):
-                    cfg.plateau_window=plateau_window
-                    cfg.plateau_thresh=plateau_thresh
-                    results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=12000, modeltype=modeltype,method=method)
-                    plot_exp_A(results_A, depths, rank=2,outfile=f'{args.outdir}/exp_A_deep_{modeltype}_{method}.png')
-        else:
-            results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=12000)
-            plot_exp_A(results_A, depths, rank=2, outfile=f'{args.outdir}/exp_A_deep_linear.png')
+        with open("exp_A.log","w") as fpw:
+            if(args.regression):
+                print("regression")
+                for plateau_window,plateau_thresh,method,modeltype in itertools.product(
+                        [1,10,100],[0.01,0.1,1],["weight","featuremap","jacobian"],["linear","CNN","Attention"]):
+                        cfg.plateau_window=plateau_window
+                        cfg.plateau_thresh=plateau_thresh
+                        results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=args.n_epochs, modeltype=modeltype,method=method,fpw=fpw)
+                        try:
+                            plot_exp_A(results_A, depths, rank=2,outfile=f'{args.outdir}/exp_A_deep_{modeltype}_{method}.png')
+                        except:
+                            pass
+            else:
+                results_A = run_exp_A(cfg, d=10, depths=depths, rank=2, n_steps=12000,fpw=fpw)
+                plot_exp_A(results_A, depths, rank=2, outfile=f'{args.outdir}/exp_A_deep_linear.png')
     if run_B:
         banner("Experiment B: Grokking — Symmetry Acquisition")
         print("NOTE: Requires ~100k steps to observe grokking. Set n_epochs accordingly.")
-        n_epochs=5000 # 本番は100000推奨。短いと汎化未観測
-        results_B = run_exp_B( p=23, weight_decays=[0.0, 1.0, 5.0],n_epochs=n_epochs)
-        plot_exp_B(results_B, outfile=f'{args.outdir}/exp_B_grokking_{n_epochs}.png')
+        results_B = run_exp_B( p=23, weight_decays=[0.0, 1.0, 5.0],n_epochs=args.n_epochs)
+        plot_exp_B(results_B, outfile=f'{args.outdir}/exp_B_grokking_{args.n_epochs}.png')
     if run_C:
         banner("Experiment C: Data-Network Symmetry Mismatch")
         configs_C = [
@@ -1103,11 +1114,11 @@ def main():
             dict(sym='high', width=16,  label='High sym + narrow NW',color='#4A90D9', ls='--'),
             dict(sym='low',  width=16,  label='Low sym  + narrow NW',color='#EF9F27', ls='--'),
         ]
-        results_C = run_exp_C(configs_C, n_epochs=3000)
+        results_C = run_exp_C(configs_C, n_epochs=args.n_epochs)
         plot_exp_C(results_C, configs_C,outfile=f'{args.outdir}/exp_C_symmetry.png')
     if run_D:
         banner("Experiment D: Stochastic Collapse")
-        results_D = run_exp_D(batch_sizes=[8, 64, 512], n_epochs=3000)
+        results_D = run_exp_D(batch_sizes=[8, 64, 512], n_epochs=args.n_epochs)
         plot_exp_D(results_D, outfile=f'{args.outdir}/exp_D_collapse.png')
     print("\nAll done.")
 

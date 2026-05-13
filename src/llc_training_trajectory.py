@@ -237,6 +237,8 @@ class LLCConfig:
     max_samples: int = 2000  # cap on number of samples used
     verbose: bool = False
     method:str= "default"
+    plateau_window:int=10
+    plateau_thresh:float=0.1
 
 
 def flatten_params(model: nn.Module) -> torch.Tensor:
@@ -582,7 +584,7 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated epsilons for volume scaling")
     parser.add_argument("--llc_max_samples", type=int, default=2000)
     parser.add_argument("--llc_verbose", action="store_true")
-    parser.add_argument("--llc_method", type=str, default="default"),
+    parser.add_argument("--llc_method", type=str, default="default")
     return parser.parse_args()
 
 
